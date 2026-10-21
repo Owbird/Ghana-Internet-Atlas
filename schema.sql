@@ -57,3 +57,11 @@ CREATE TABLE IF NOT EXISTS pacing (
  next_at timestamptz NOT NULL DEFAULT now(), cooldown_until timestamptz NOT NULL DEFAULT now()
 );
 INSERT INTO pacing(id,rate) VALUES(1,2) ON CONFLICT DO NOTHING;
+
+-- Host-scoped pacing replaces the legacy global row, retained for old clients.
+CREATE TABLE IF NOT EXISTS host_pacing (
+ hostname text PRIMARY KEY,
+ rate double precision NOT NULL DEFAULT 5 CHECK(rate > 0),
+ next_at timestamptz NOT NULL DEFAULT now(),
+ cooldown_until timestamptz NOT NULL DEFAULT now()
+);

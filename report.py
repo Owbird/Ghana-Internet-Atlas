@@ -1041,7 +1041,9 @@ def distributed_section(data):
     rows = ''.join(
         f"<tr><td>{esc(w['hostname'])}</td><td>{esc(w['instance'])}</td>"
         f"<td>{esc(w['health'])}</td><td>{esc(w['heartbeat'])}</td>"
-        f"<td>{w['requests']:,}</td><td>{w['saved']:,}</td></tr>"
+        f"<td>{w['requests']:,}</td><td>{w['saved']:,}</td>"
+        f"<td>{esc(w['host_rate']) + '/s' if 'host_rate' in w else '—'}</td>"
+        f"<td>{str(round(float(w['host_pause']), 1)) + 's' if 'host_pause' in w else '—'}</td></tr>"
         for w in info['workers']
     )
     counts = info['counts']
@@ -1051,10 +1053,11 @@ def distributed_section(data):
         f"Run {info['run']} · {terminal:,}/{info['total']:,} terminal addresses · "
         f"{counts.get('retry', 0):,} awaiting retry · "
         f"{counts.get('exhausted', 0):,} exhausted · "
-        f"shared cooldown {info['cooldown']:.1f}s · "
-        f"aggregate budget {info['rate']:g} requests/s. Worker counts below are per process.",
+        "Rate budgets and cooldowns apply independently to each hostname. "
+        "Worker counts below are per process; repeated host settings are shared.",
         '<div class="table-wrap"><table><thead><tr><th>Host</th><th>Instance</th>'
         '<th>Health</th><th>Last heartbeat</th><th>Requests</th><th>Saved</th>'
+        '<th>Host budget</th><th>Host cooldown</th>'
         '</tr></thead><tbody>'+rows+'</tbody></table></div>',
     )
 
@@ -1083,9 +1086,15 @@ def main():
             workers = db.execute("""SELECT *, CASE WHEN state='stopped' THEN 'stopped'
                 WHEN heartbeat<now()-interval '90 seconds' THEN 'stale' ELSE 'healthy' END AS health
                 FROM workers WHERE run_id=%s ORDER BY hostname,started_at""", (run['id'],)).fetchall()
-            pace = db.execute('SELECT rate,greatest(0,extract(epoch FROM cooldown_until-now())) AS pause FROM pacing WHERE id=1').fetchone()
+            if db.execute("SELECT to_regclass('host_pacing') AS name").fetchone()['name']:
+                hosts = {r['hostname']: r for r in db.execute('''SELECT hostname,rate,
+                    greatest(0,extract(epoch FROM cooldown_until-clock_timestamp())) AS pause FROM host_pacing''')}
+                for worker in workers:
+                    host = hosts.get(worker['hostname'])
+                    if host:
+                        worker.update(host_rate=host['rate'], host_pause=host['pause'])
             data['distributed'] = dict(run=run['id'], total=run['total'], counts=counts,
-                workers=workers, cooldown=float(pace['pause']), rate=pace['rate'])
+                workers=workers)
             snapshot['total_ipv4_addresses'] = run['total']
             snapshot['merged_range_count'] = db.execute('SELECT count(*) AS n FROM lookup_ranges WHERE run_id=%s', (run['id'],)).fetchone()['n']
             document = build_report(data, snapshot, f"PostgreSQL run {run['id']}", owners, args.max_ports)

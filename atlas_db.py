@@ -5,6 +5,9 @@ import ipaddress
 import json
 import math
 import os
+import queue
+import socket
+from contextlib import contextmanager
 from pathlib import Path
 from uuid import uuid4
 
@@ -22,20 +25,60 @@ class LeaseLost(RuntimeError):
     pass
 
 
-def connect():
+_pool = None
+
+
+def enable_pool(size=3):
+    """Worker-only bounded lazy pool; one connection per short transaction."""
+    global _pool
+    _pool = queue.LifoQueue(size)
+    for _ in range(size):
+        _pool.put(None)
+
+
+def close_pool():
+    global _pool
+    pool, _pool = _pool, None
+    if pool:
+        while not pool.empty():
+            db = pool.get_nowait()
+            if db is not None:
+                db.close()
+
+
+def _open_connection():
     load_dotenv()
     url = os.getenv('DATABASE_URL')
     if not url:
         raise ValueError('Set DATABASE_URL in .env before continuing.')
-    db = psycopg.connect(url, row_factory=dict_row, connect_timeout=5, prepare_threshold=None)
-    # Transaction-local settings also work with transaction-mode poolers.
+    return psycopg.connect(url, row_factory=dict_row, connect_timeout=5, prepare_threshold=None)
+
+
+@contextmanager
+def connect():
+    pool = _pool
+    db = pool.get(timeout=10) if pool else None
     try:
-        db.execute("SET LOCAL statement_timeout = '10s'")
-        db.execute("SET LOCAL lock_timeout = '5s'")
-    except Exception:
-        db.close()
-        raise
-    return db
+        if db is None or db.closed:
+            db = _open_connection()
+        with db.transaction():
+            with db.pipeline():
+                db.execute("SET LOCAL statement_timeout = '10s'")
+                db.execute("SET LOCAL lock_timeout = '5s'")
+            yield db
+    finally:
+        if pool:
+            pool.put(db if db is not None and not db.closed else None)
+        elif db is not None:
+            db.close()
+
+
+HOST_SCHEMA = """CREATE TABLE IF NOT EXISTS host_pacing (
+ hostname text PRIMARY KEY,
+ rate double precision NOT NULL DEFAULT 5 CHECK(rate > 0),
+ next_at timestamptz NOT NULL DEFAULT now(),
+ cooldown_until timestamptz NOT NULL DEFAULT now()
+)"""
 
 
 def initialize():
@@ -101,6 +144,11 @@ def seed(snapshot, activate=False):
 
 def register(instance, hostname):
     with connect() as db:
+        # Additive upgrade; existing installations still start with only scan.py.
+        if db.execute("SELECT to_regclass('host_pacing') AS name").fetchone()['name'] is None:
+            db.execute('SELECT pg_advisory_xact_lock(42178503)')
+            db.execute(HOST_SCHEMA)
+        db.execute('INSERT INTO host_pacing(hostname) VALUES(%s) ON CONFLICT DO NOTHING', (hostname,))
         run = selected_run(db)
         db.execute('SELECT id FROM runs WHERE id=%s FOR SHARE', (run['id'],))
         db.execute('INSERT INTO workers(instance,hostname,run_id) VALUES(%s,%s,%s) ON CONFLICT(instance) DO NOTHING',
@@ -136,54 +184,62 @@ def heartbeat(instance, job, requests, saved, state='running'):
         db.execute('UPDATE workers SET heartbeat=now(),state=%s,requests=%s,saved=%s WHERE instance=%s',
                    (state, requests, saved, instance))
         counts = db.execute('SELECT status,count FROM run_counts WHERE run_id=(SELECT run_id FROM workers WHERE instance=%s)', (instance,)).fetchall()
-        cooldown = db.execute('SELECT greatest(0,extract(epoch FROM cooldown_until-now())) AS seconds FROM pacing WHERE id=1').fetchone()
+        cooldown = db.execute('''SELECT greatest(0,extract(epoch FROM h.cooldown_until-clock_timestamp())) AS seconds
+            FROM host_pacing h JOIN workers w USING(hostname) WHERE w.instance=%s''', (instance,)).fetchone()
         return {r['status']: r['count'] for r in counts}, float(cooldown['seconds'])
 
 
-def reserve(job, limit=4):
-    """Allocate a small immediate wave, recording attempts before HTTP. No future permits."""
+def prepare(job, exclude=(), limit=32):
+    """Read a bounded batch and durably consume its attempts before HTTP dispatch."""
     with connect() as db:
         fence(db, job)
-        pace = db.execute('SELECT *,now() AS current FROM pacing WHERE id=1 FOR UPDATE').fetchone()
-        wait = (max(pace['next_at'], pace['cooldown_until'])-pace['current']).total_seconds()
-        if wait > 0:
-            return [], min(wait, 1.0)
-        rows = db.execute('''SELECT host(a.ip) AS ip FROM generate_series(0,%s) n
+        return db.execute("""WITH candidates AS (
+            SELECT a.ip FROM generate_series(0,%s) n
             CROSS JOIN LATERAL (SELECT %s::inet+n AS ip) a
             LEFT JOIN observations o ON o.ip=a.ip AND o.run_id=%s
-            WHERE
+            WHERE NOT (a.ip=ANY(%s::inet[])) AND
             (o.status IS NULL OR (o.status='retry' AND o.next_retry<=now() AND o.attempts<%s))
-            ORDER BY a.ip LIMIT %s''', (job['size']-1, str(job['first_ip']), job['run_id'], MAX_ATTEMPTS, limit)).fetchall()
-        # A run-qualified join is essential when the same IP occurs in older runs.
-        ips = [r['ip'] for r in rows]
-        for ip in ips:
-            db.execute('''INSERT INTO observations(run_id,ip,status,attempts,next_retry,worker)
-                VALUES(%s,%s,'retry',1,now()+interval '45 seconds',%s)
-                ON CONFLICT(run_id,ip) DO UPDATE SET attempts=observations.attempts+1,
-                next_retry=now()+interval '45 seconds', worker=excluded.worker''',
-                (job['run_id'], ip, job['owner']))
-        if ips:
-            db.execute("UPDATE pacing SET next_at=now()+(%s/rate)*interval '1 second' WHERE id=1", (len(ips),))
-        return ips, 0
+            ORDER BY a.ip LIMIT %s
+        ) INSERT INTO observations(run_id,ip,status,attempts,next_retry,worker)
+          SELECT %s,ip,'retry',1,now()+interval '90 seconds',%s FROM candidates WHERE true
+          ON CONFLICT(run_id,ip) DO UPDATE SET attempts=observations.attempts+1,
+            next_retry=excluded.next_retry,worker=excluded.worker
+          RETURNING host(ip) AS ip, attempts""",
+          (job['size']-1, str(job['first_ip']), job['run_id'], list(exclude), MAX_ATTEMPTS,
+           limit, job['run_id'], job['owner'])).fetchall()
 
 
 def save(job, results):
     with connect() as db:
         fence(db, job)
-        for ip, status, payload, error, delay in results:
-            row = db.execute('SELECT attempts FROM observations WHERE run_id=%s AND ip=%s', (job['run_id'], ip)).fetchone()
-            if status == 'retry' and row['attempts'] >= MAX_ATTEMPTS:
-                status = 'exhausted'
-            db.execute('''UPDATE observations SET status=%s,payload=%s,error=%s,
-                fetched_at=now(),next_retry=now()+%s*interval '1 second'
-                WHERE run_id=%s AND ip=%s''',
-                (status, Jsonb(payload) if payload is not None else None, error,
-                 delay, job['run_id'], ip))
+        records = [dict(ip=ip, status=status, payload=payload, error=error, delay=delay)
+                   for ip, status, payload, error, delay in results]
+        db.execute("""UPDATE observations o SET
+            status=CASE WHEN r.status='retry' AND o.attempts>=%s THEN 'exhausted' ELSE r.status END,
+            payload=r.payload,error=r.error,fetched_at=now(),
+            next_retry=now()+r.delay*interval '1 second'
+            FROM jsonb_to_recordset(%s) AS r(ip inet,status text,payload jsonb,error text,delay double precision)
+            WHERE o.run_id=%s AND o.ip=r.ip""", (MAX_ATTEMPTS, Jsonb(records), job['run_id']))
 
 
-def cooldown(seconds):
+def host_permits(hostname, limit=4):
+    """Small immediate allocations per hostname, independent of other hosts."""
     with connect() as db:
-        db.execute("UPDATE pacing SET cooldown_until=greatest(cooldown_until,clock_timestamp()+%s*interval '1 second') WHERE id=1", (seconds,))
+        row = db.execute('''SELECT *,clock_timestamp() AS current FROM host_pacing
+            WHERE hostname=%s FOR UPDATE''', (hostname,)).fetchone()
+        wait = (max(row['next_at'], row['cooldown_until'])-row['current']).total_seconds()
+        if wait > 0:
+            return 0, min(wait, 1), max(0, (row['cooldown_until']-row['current']).total_seconds())
+        db.execute("""UPDATE host_pacing SET next_at=clock_timestamp()+%s/rate*interval '1 second'
+            WHERE hostname=%s""", (limit, hostname))
+        return limit, limit/row['rate'], 0
+
+
+def cooldown(hostname, seconds):
+    with connect() as db:
+        db.execute("""UPDATE host_pacing SET
+            cooldown_until=greatest(cooldown_until,clock_timestamp()+%s*interval '1 second')
+            WHERE hostname=%s""", (seconds, hostname))
 
 
 def release(job):
@@ -206,7 +262,8 @@ def release(job):
 def main():
     parser = argparse.ArgumentParser(description='Initialize the schema or manage run activation.')
     parser.add_argument('--deactivate', type=int)
-    parser.add_argument('--rate', type=float, help='Set the shared aggregate requests/second budget')
+    parser.add_argument('--rate', type=float, help='Set requests/second for --host (default: this hostname)')
+    parser.add_argument('--host', default=socket.gethostname())
     args = parser.parse_args()
     initialize()
     with connect() as db:
@@ -215,7 +272,8 @@ def main():
         if args.rate is not None:
             if not math.isfinite(args.rate) or args.rate <= 0:
                 parser.error('--rate must be positive')
-            db.execute('UPDATE pacing SET rate=%s WHERE id=1', (args.rate,))
+            db.execute('''INSERT INTO host_pacing(hostname,rate) VALUES(%s,%s)
+                ON CONFLICT(hostname) DO UPDATE SET rate=excluded.rate''', (args.host, args.rate))
     print('Schema ready.')
 
 
