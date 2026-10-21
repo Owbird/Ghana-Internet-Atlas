@@ -148,15 +148,19 @@ class Worker:
                         # Finish the short transaction before returning its pooled connection.
                         await operation
                         raise
-                except (psycopg.OperationalError, queue.Empty):
+                except (psycopg.OperationalError, queue.Empty) as exc:
                     if not failed:
                         failed = True
                         self.db_failures += 1
                         self.db_ok.clear()
-                    log.error('Database unavailable (%s), dispatch paused; attempt %s/6', function.__name__, attempt+1)
+                    log.error('Database operation failed (%s): %s SQLSTATE=%s; dispatch paused; attempt %s/6',
+                              function.__name__, type(exc).__name__, getattr(exc, 'sqlstate', None) or 'none', attempt+1)
                     if attempt == 5:
                         self.lost = True
-                        raise RuntimeError('Database unavailable after bounded retries') from None
+                        raise RuntimeError(
+                            f'Database {function.__name__} failed after bounded retries: '
+                            f'{type(exc).__name__} SQLSTATE={getattr(exc, "sqlstate", None) or "none"}'
+                        ) from None
                     await asyncio.sleep(min(15, 2**attempt))
         finally:
             if failed:

@@ -66,6 +66,12 @@ def connect():
                 db.execute("SET LOCAL statement_timeout = '10s'")
                 db.execute("SET LOCAL lock_timeout = '5s'")
             yield db
+    except psycopg.OperationalError as exc:
+        # Discard a failed transport even if libpq has not marked it closed yet.
+        # Server-side lock/statement timeouts leave a reusable connection after rollback.
+        if db is not None and (not exc.sqlstate or exc.sqlstate.startswith('08')):
+            db.close()
+        raise
     finally:
         if pool:
             pool.put(db if db is not None and not db.closed else None)
@@ -197,6 +203,7 @@ def prepare(job, exclude=(), limit=32):
             SELECT a.ip FROM generate_series(0,%s) n
             CROSS JOIN LATERAL (SELECT %s::inet+n AS ip) a
             LEFT JOIN observations o ON o.ip=a.ip AND o.run_id=%s
+                AND o.ip BETWEEN %s::inet AND %s::inet
             WHERE NOT (a.ip=ANY(%s::inet[])) AND
             (o.status IS NULL OR (o.status='retry' AND o.next_retry<=now() AND o.attempts<%s))
             ORDER BY a.ip LIMIT %s
@@ -205,7 +212,8 @@ def prepare(job, exclude=(), limit=32):
           ON CONFLICT(run_id,ip) DO UPDATE SET attempts=observations.attempts+1,
             next_retry=excluded.next_retry,worker=excluded.worker
           RETURNING host(ip) AS ip, attempts""",
-          (job['size']-1, str(job['first_ip']), job['run_id'], list(exclude), MAX_ATTEMPTS,
+          (job['size']-1, str(job['first_ip']), job['run_id'],
+           str(job['first_ip']), str(job['last_ip']), list(exclude), MAX_ATTEMPTS,
            limit, job['run_id'], job['owner'])).fetchall()
 
 
