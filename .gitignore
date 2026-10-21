@@ -1,1 +1,7 @@
 /ghana_routes.json
+/venv
+/ghana_internetdb.sqlite
+/ghana_internetdb.sqlite-shm
+/ghana_internetdb.sqlite-wal
+/ghana_report.html
+/scan.log
