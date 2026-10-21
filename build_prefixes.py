@@ -52,9 +52,29 @@ session.mount(
 )
 
 asn_prefixes = {}
+asn_names = {}
+asn_name_failures = {}
 failures = {}
 
 for i, asn in enumerate(asns, start=1):
+    asn_names[asn] = None
+    try:
+        response = session.get(
+            "https://stat.ripe.net/data/as-overview/data.json",
+            params={"resource": f"AS{asn}"},
+            timeout=30,
+        )
+        response.raise_for_status()
+        overview = response.json()
+
+        if overview.get("status") != "ok":
+            raise RuntimeError(overview.get("messages"))
+
+        # RIPEstat returns null for ASNs without a registered holder.
+        asn_names[asn] = overview["data"]["holder"]
+    except (requests.RequestException, ValueError, KeyError, RuntimeError) as exc:
+        asn_name_failures[asn] = str(exc)
+
     try:
         response = session.get(
             "https://stat.ripe.net/data/announced-prefixes/data.json",
@@ -95,6 +115,7 @@ total_ips = sum(network.num_addresses for network in ipv4_ranges)
 print(f"\n\nASNs collected: {len(asn_prefixes):,}")
 print(f"ASNs with no prefixes: {sum(not p for p in asn_prefixes.values()):,}")
 print(f"Failed ASNs: {len(failures):,}")
+print(f"Failed ASN name lookups: {len(asn_name_failures):,}")
 print(f"Unique IPv4 prefixes: {len(ipv4_networks):,}")
 print(f"Merged IPv4 ranges: {len(ipv4_ranges):,}")
 print(f"Unique IPv4 addresses: {total_ips:,}")
@@ -102,11 +123,16 @@ print(f"Unique IPv4 addresses: {total_ips:,}")
 if failures:
     print("\nFailures:", failures)
 
+if asn_name_failures:
+    print("\nASN name lookup failures:", asn_name_failures)
+
 checkpoint = {
     "collected_at": datetime.now(timezone.utc).isoformat(),
     "query_starttime": starttime,
     "query_endtime": endtime,
     "asns": asns,
+    "asn_names": asn_names,
+    "asn_name_failures": asn_name_failures,
     "asn_prefixes": asn_prefixes,
     "failures": failures,
     "ipv4_ranges": [str(network) for network in ipv4_ranges],
