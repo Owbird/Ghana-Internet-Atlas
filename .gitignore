@@ -5,3 +5,16 @@
 /ghana_internetdb.sqlite-wal
 /ghana_report.html
 /scan.log
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite-*
+*.db
+*.log
+__pycache__/
+*.pyc
+.pytest_cache/
+/reports/
+/ghana_*routes*.json
+/ghana_*report*.html

@@ -1,145 +1,168 @@
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-import ipaddress
+import argparse
 import json
-from datetime import datetime, timezone
+from pathlib import Path
+import atlas_db
 
 
-url = "https://stat.ripe.net/data/country-resource-list/data.json"
+def fetch_snapshot():
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+    import ipaddress
+    import json
+    from datetime import datetime, timezone
 
-response = requests.get(url, params={"resource": "gh"}, timeout=30)
-response.raise_for_status()
-payload = response.json()
 
-if payload.get("status") != "ok":
-    raise RuntimeError(f"RIPEstat request failed: {payload.get('messages')}")
+    url = "https://stat.ripe.net/data/country-resource-list/data.json"
 
-asns = payload["data"]["resources"]["asn"]
+    response = requests.get(url, params={"resource": "gh"}, timeout=30)
+    response.raise_for_status()
+    payload = response.json()
 
-print(f"Total ASNs: {len(asns)}")
+    if payload.get("status") != "ok":
+        raise RuntimeError(f"RIPEstat request failed: {payload.get('messages')}")
 
-asn = asns[0]
+    asns = payload["data"]["resources"]["asn"]
 
-response = requests.get(
-    "https://stat.ripe.net/data/announced-prefixes/data.json",
-    params={"resource": f"AS{asn}"},
-    timeout=30,
-)
-response.raise_for_status()
-payload = response.json()
+    print(f"Total ASNs: {len(asns)}")
 
-if payload.get("status") != "ok":
-    raise RuntimeError(f"RIPEstat request failed: {payload.get('messages')}")
+    asn = asns[0]
 
-prefixes = payload["data"]["prefixes"]
+    response = requests.get(
+        "https://stat.ripe.net/data/announced-prefixes/data.json",
+        params={"resource": f"AS{asn}"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
 
-print(f"AS{asn}: {len(prefixes)} prefixes")
-print("Query window:", payload["data"].get("query_starttime"),
-      "to", payload["data"].get("query_endtime"))
+    if payload.get("status") != "ok":
+        raise RuntimeError(f"RIPEstat request failed: {payload.get('messages')}")
 
-starttime = payload["data"]["query_starttime"]
-endtime = payload["data"]["query_endtime"]
+    prefixes = payload["data"]["prefixes"]
 
-session = requests.Session()
-session.mount(
-    "https://",
-    HTTPAdapter(max_retries=Retry(
-        total=3,
-        backoff_factor=1,
-        status_forcelist=[429, 500, 502, 503, 504],
-    )),
-)
+    print(f"AS{asn}: {len(prefixes)} prefixes")
+    print("Query window:", payload["data"].get("query_starttime"),
+          "to", payload["data"].get("query_endtime"))
 
-asn_prefixes = {}
-asn_names = {}
-asn_name_failures = {}
-failures = {}
+    starttime = payload["data"]["query_starttime"]
+    endtime = payload["data"]["query_endtime"]
 
-for i, asn in enumerate(asns, start=1):
-    asn_names[asn] = None
-    try:
-        response = session.get(
-            "https://stat.ripe.net/data/as-overview/data.json",
-            params={"resource": f"AS{asn}"},
-            timeout=30,
-        )
-        response.raise_for_status()
-        overview = response.json()
+    session = requests.Session()
+    session.mount(
+        "https://",
+        HTTPAdapter(max_retries=Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )),
+    )
 
-        if overview.get("status") != "ok":
-            raise RuntimeError(overview.get("messages"))
+    asn_prefixes = {}
+    asn_names = {}
+    asn_name_failures = {}
+    failures = {}
 
-        # RIPEstat returns null for ASNs without a registered holder.
-        asn_names[asn] = overview["data"]["holder"]
-    except (requests.RequestException, ValueError, KeyError, RuntimeError) as exc:
-        asn_name_failures[asn] = str(exc)
+    for i, asn in enumerate(asns, start=1):
+        asn_names[asn] = None
+        try:
+            response = session.get(
+                "https://stat.ripe.net/data/as-overview/data.json",
+                params={"resource": f"AS{asn}"},
+                timeout=30,
+            )
+            response.raise_for_status()
+            overview = response.json()
 
-    try:
-        response = session.get(
-            "https://stat.ripe.net/data/announced-prefixes/data.json",
-            params={
-                "resource": f"AS{asn}",
-                "starttime": starttime,
-                "endtime": endtime,
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
-        result = response.json()
+            if overview.get("status") != "ok":
+                raise RuntimeError(overview.get("messages"))
 
-        if result.get("status") != "ok":
-            raise RuntimeError(result.get("messages"))
+            # RIPEstat returns null for ASNs without a registered holder.
+            asn_names[asn] = overview["data"]["holder"]
+        except (requests.RequestException, ValueError, KeyError, RuntimeError) as exc:
+            asn_name_failures[asn] = str(exc)
 
-        # Retain timelines and the relationship between ASN and prefix.
-        asn_prefixes[asn] = result["data"]["prefixes"]
+        try:
+            response = session.get(
+                "https://stat.ripe.net/data/announced-prefixes/data.json",
+                params={
+                    "resource": f"AS{asn}",
+                    "starttime": starttime,
+                    "endtime": endtime,
+                },
+                timeout=30,
+            )
+            response.raise_for_status()
+            result = response.json()
 
-    except (requests.RequestException, ValueError, KeyError, RuntimeError) as exc:
-        failures[asn] = str(exc)
+            if result.get("status") != "ok":
+                raise RuntimeError(result.get("messages"))
 
-    print(f"\rFetched {i}/{len(asns)} ASNs | failures: {len(failures)}",
-          end="", flush=True)
+            # Retain timelines and the relationship between ASN and prefix.
+            asn_prefixes[asn] = result["data"]["prefixes"]
 
-session.close()
+        except (requests.RequestException, ValueError, KeyError, RuntimeError) as exc:
+            failures[asn] = str(exc)
 
-ipv4_networks = {
-    ipaddress.ip_network(entry["prefix"])
-    for entries in asn_prefixes.values()
-    for entry in entries
-    if ipaddress.ip_network(entry["prefix"]).version == 4
-}
+        print(f"\rFetched {i}/{len(asns)} ASNs | failures: {len(failures)}",
+              end="", flush=True)
 
-ipv4_ranges = list(ipaddress.collapse_addresses(ipv4_networks))
-total_ips = sum(network.num_addresses for network in ipv4_ranges)
+    session.close()
 
-print(f"\n\nASNs collected: {len(asn_prefixes):,}")
-print(f"ASNs with no prefixes: {sum(not p for p in asn_prefixes.values()):,}")
-print(f"Failed ASNs: {len(failures):,}")
-print(f"Failed ASN name lookups: {len(asn_name_failures):,}")
-print(f"Unique IPv4 prefixes: {len(ipv4_networks):,}")
-print(f"Merged IPv4 ranges: {len(ipv4_ranges):,}")
-print(f"Unique IPv4 addresses: {total_ips:,}")
+    ipv4_networks = {
+        ipaddress.ip_network(entry["prefix"])
+        for entries in asn_prefixes.values()
+        for entry in entries
+        if ipaddress.ip_network(entry["prefix"]).version == 4
+    }
 
-if failures:
-    print("\nFailures:", failures)
+    ipv4_ranges = list(ipaddress.collapse_addresses(ipv4_networks))
+    total_ips = sum(network.num_addresses for network in ipv4_ranges)
 
-if asn_name_failures:
-    print("\nASN name lookup failures:", asn_name_failures)
+    print(f"\n\nASNs collected: {len(asn_prefixes):,}")
+    print(f"ASNs with no prefixes: {sum(not p for p in asn_prefixes.values()):,}")
+    print(f"Failed ASNs: {len(failures):,}")
+    print(f"Failed ASN name lookups: {len(asn_name_failures):,}")
+    print(f"Unique IPv4 prefixes: {len(ipv4_networks):,}")
+    print(f"Merged IPv4 ranges: {len(ipv4_ranges):,}")
+    print(f"Unique IPv4 addresses: {total_ips:,}")
 
-checkpoint = {
-    "collected_at": datetime.now(timezone.utc).isoformat(),
-    "query_starttime": starttime,
-    "query_endtime": endtime,
-    "asns": asns,
-    "asn_names": asn_names,
-    "asn_name_failures": asn_name_failures,
-    "asn_prefixes": asn_prefixes,
-    "failures": failures,
-    "ipv4_ranges": [str(network) for network in ipv4_ranges],
-    "total_ipv4_addresses": total_ips,
-}
+    if failures:
+        print("\nFailures:", failures)
 
-with open("ghana_routes.json", "w") as f:
-    json.dump(checkpoint, f, indent=2)
+    if asn_name_failures:
+        print("\nASN name lookup failures:", asn_name_failures)
 
-print("Saved ghana_routes.json")
+    checkpoint = {
+        "collected_at": datetime.now(timezone.utc).isoformat(),
+        "query_starttime": starttime,
+        "query_endtime": endtime,
+        "asns": asns,
+        "asn_names": asn_names,
+        "asn_name_failures": asn_name_failures,
+        "asn_prefixes": asn_prefixes,
+        "failures": failures,
+        "ipv4_ranges": [str(network) for network in ipv4_ranges],
+        "total_ipv4_addresses": total_ips,
+    }
+
+    with open("ghana_routes.json", "w") as f:
+        json.dump(checkpoint, f, indent=2)
+
+    print("Saved ghana_routes.json")
+    return checkpoint
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Fetch RIPE-only Ghana routes and seed PostgreSQL jobs.")
+    parser.add_argument('--snapshot', type=Path, help='Seed an existing snapshot without HTTP requests')
+    parser.add_argument('--activate', action='store_true', help='Activate this run; refuses to replace another active run')
+    args = parser.parse_args()
+    snapshot = json.loads(args.snapshot.read_text()) if args.snapshot else fetch_snapshot()
+    atlas_db.initialize()
+    run = atlas_db.seed(snapshot, args.activate)
+    print(f'Seeded run {run}. Active requested: {args.activate}')
+
+
+if __name__ == '__main__':
+    main()
