@@ -1039,12 +1039,14 @@ filter();
 def distributed_section(data):
     info = data['distributed']
     rows = ''.join(
-        f"<tr><td>{esc(w['hostname'])}</td><td>{esc(w['instance'])}</td>"
-        f"<td>{esc(w['health'])}</td><td>{esc(w['heartbeat'])}</td>"
+        f"<tr><td>{number}</td><td>{esc(w['hostname'])}</td><td>{esc(w['instance'])}</td>"
+        f"<td>{esc(w['health'])}</td><td>{esc(w['heartbeat_ago'])}</td>"
         f"<td>{w['requests']:,}</td><td>{w['saved']:,}</td>"
         f"<td>{esc(w['host_rate']) + '/s' if 'host_rate' in w else '—'}</td>"
         f"<td>{str(round(float(w['host_pause']), 1)) + 's' if 'host_pause' in w else '—'}</td></tr>"
-        for w in info['workers'] if w['health'] == 'healthy'
+        for number, w in enumerate(
+            (worker for worker in info['workers'] if worker['health'] == 'healthy'), start=1
+        )
     )
     counts = info['counts']
     terminal = sum(counts.get(key, 0) for key in ('ok', 'no_data', 'exhausted'))
@@ -1056,7 +1058,7 @@ def distributed_section(data):
         "Rate budgets and cooldowns apply independently to each hostname. "
         "Only healthy workers are shown. Worker counts below are per process; "
         "repeated host settings are shared.",
-        '<div class="table-wrap"><table><thead><tr><th>Host</th><th>Instance</th>'
+        '<div class="table-wrap"><table><thead><tr><th>#</th><th>Host</th><th>Instance</th>'
         '<th>Health</th><th>Last heartbeat</th><th>Requests</th><th>Saved</th>'
         '<th>Host budget</th><th>Host cooldown</th>'
         '</tr></thead><tbody>'+rows+'</tbody></table></div>',
@@ -1084,7 +1086,10 @@ def main():
             data = read_database(run['id'], args.host_limit, args.max_ports, lookup, connection=db)
             counts = {r['status']: r['count'] for r in db.execute(
                 'SELECT status,count FROM run_counts WHERE run_id=%s', (run['id'],))}
-            workers = db.execute("""SELECT *, CASE WHEN state='stopped' THEN 'stopped'
+            workers = db.execute("""SELECT *,
+                floor(greatest(0, extract(epoch FROM clock_timestamp()-heartbeat))/60)::int
+                    || ' mins ago' AS heartbeat_ago,
+                CASE WHEN state='stopped' THEN 'stopped'
                 WHEN heartbeat<now()-interval '90 seconds' THEN 'stale' ELSE 'healthy' END AS health
                 FROM workers WHERE run_id=%s ORDER BY hostname,started_at""", (run['id'],)).fetchall()
             if db.execute("SELECT to_regclass('host_pacing') AS name").fetchone()['name']:
