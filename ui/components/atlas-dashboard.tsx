@@ -19,19 +19,12 @@ import {
 } from 'lucide-react'
 
 import type { Atlas, Measurement, Operator } from '@/lib/atlas'
+import { NationalSummary, ExposureBreakdown } from '@/components/atlas-overview'
 
 type Host = { ip: string; hostname: string; ports: number[]; tags: string[]; software: string; prefix: string; fetchedAt: string }
 type HostPage = { asn: string; hosts: Host[]; totalHosts: number; page: number; pageSize: number; totalPages: number; hasPrevious: boolean; hasNext: boolean }
-const emptyOperator: Operator = { name: 'No operator selected', asn: '', id: '', color: '' }
+const emptyOperator: Operator = { name: 'No operator selected', asn: '', id: '', color: '', prefixes: [], announced: 0, scanned: 0, records: 0, exposed: 0, ports: {}, tags: {} }
 const number = (value: number) => value.toLocaleString('en-US')
-
-function MetricCard({ label, value, detail, icon: Icon, tone = 'green' }: { label: string; value: string; detail: string; icon: typeof Activity; tone?: 'green' | 'neutral' }) {
-  return <div className="metric-card">
-    <div className="metric-top"><span>{label}</span><Icon className={tone === 'green' ? 'icon-green' : 'icon-muted'} /></div>
-    <strong>{value}</strong>
-    <small>{detail}</small>
-  </div>
-}
 
 function StatusPill({ children, tone = 'green' }: { children: React.ReactNode; tone?: 'green' | 'gray' | 'amber' }) {
   return <span className={`status-pill ${tone}`}>{children}</span>
@@ -40,6 +33,9 @@ function StatusPill({ children, tone = 'green' }: { children: React.ReactNode; t
 export default function AtlasDashboard({ initialData, initialError = '' }: { initialData: Atlas | null; initialError?: string }) {
   const [data, setData] = useState<Atlas | null>(initialData)
   const [operatorId, setOperatorId] = useState('')
+  useEffect(() => {
+    if (operatorId) document.getElementById('operator-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }, [operatorId])
   const [search, setSearch] = useState('')
   const [operatorSearch, setOperatorSearch] = useState('')
   const [hostSearch, setHostSearch] = useState('')
@@ -131,11 +127,12 @@ export default function AtlasDashboard({ initialData, initialError = '' }: { ini
       
       {error && <p role="alert">{error}</p>}
       {!loading && !error && !operators.length && <p>No active collection run or IPv4 operators found.</p>}
-      <div className="metrics"><MetricCard label="IPs with InternetDB records" value={number(data?.records || 0)} detail="Successful records in the active run" icon={Database} /><MetricCard label="Networks observed" value={number(data?.networks || 0)} detail="ASNs with announced IPv4 routes" icon={Network} tone="neutral" /></div>
-        <div className="workspace">
-          <aside className="operator-sidebar"><div className="section-label"><span>Operators</span><span className="count">{operators.length}</span></div><div className="operator-search"><Search /><input aria-label="Search operators" placeholder="Filter operators" value={operatorSearch} onChange={e => setOperatorSearch(e.target.value)} /></div><div className="operator-list">{operators.filter(o => `${o.name} ${o.asn}`.toLowerCase().includes(operatorSearch.toLowerCase())).map((item) => <button key={item.id} className={`operator-row ${operator.id === item.id ? 'selected' : ''}`} onClick={() => { setOperatorId(item.id); setSelectedHost(null); setPage(1) }}><span className={`operator-logo ${item.color}`}>{item.name.slice(0, 1)}</span><span className="operator-copy"><b>{item.name}</b><small>{item.asn}</small></span></button>)}</div><div className="sidebar-note"><CircleHelp /><span>Coverage describes collected addresses, not physical devices.</span></div></aside>
+      <NationalSummary data={data} />
+        <div className="workspace" id="operator-panel">
+          <aside className="operator-sidebar"><div className="section-label"><span>Operators</span><span className="count">{operators.length}</span></div><div className="operator-search"><Search /><input aria-label="Search operators" placeholder="Filter operators" value={operatorSearch} onChange={e => setOperatorSearch(e.target.value)} /></div><div className="operator-list">{operators.filter(o => `${o.name} ${o.asn}`.toLowerCase().includes(operatorSearch.toLowerCase())).map((item) => <button key={item.id} className={`operator-row ${operator.id === item.id ? 'selected' : ''}`} onClick={() => { setOperatorId(item.id); setSelectedHost(null); setPage(1) }}><span className={`operator-logo ${item.color}`}>{item.name.slice(0, 1)}</span><span className="operator-copy"><b>{item.name}</b><small>{item.asn}</small></span></button>)}</div><div className="sidebar-note"><CircleHelp /><span>Host records describe addresses, not distinct devices or subscribers.</span></div></aside>
           <section className="operator-main"><div className="operator-header"><div><p className="eyebrow">SELECTED OPERATOR</p><h2>{operator.name} <span>{operator.asn}</span></h2></div><StatusPill><span className="tiny-dot" /> {loading ? 'Loading' : error ? 'Unavailable' : 'Database snapshot'}</StatusPill></div>
             {currentApnic?.error && <p role="alert">{currentApnic.error}</p>}{operator.id && currentApnic && !currentApnic.error && !measurement ? <section className="no-records" aria-labelledby="no-measurement-title"><Activity aria-hidden="true" /><h3 id="no-measurement-title">No measurement yet</h3><p>No APNIC measurement has been imported for {operator.asn} yet.</p></section> : <div className="insight-grid"><div className="insight-card"><div className="card-heading"><span>APNIC user reach</span><ExternalLink /></div><div className="insight-values"><div><strong>{measurement ? number(Number(measurement.estimated_users)) : '—'}</strong><small>estimated Ghana users</small></div><div><strong>{measurement ? `${measurement.country_percent}%` : '—'}</strong><small>estimated share of users</small></div></div><div className="card-foot"><Clock3 /> Measurement: {apnicStatus}</div></div></div>}
+            <ExposureBreakdown operator={operator} />
             {hostsError && <p role="alert">{hostsError}</p>}
             {noRecords ? <section className="no-records" aria-labelledby="no-records-title"><Database aria-hidden="true" /><h3 id="no-records-title">No record yet</h3><p>No host records have been collected for {operator.asn} yet.</p><button className="refresh-button" onClick={() => setRefresh(v => v + 1)}><RefreshCw /> Refresh data</button></section> : <div className="table-card" aria-busy={tableLoading}><div className="table-toolbar"><div className="tabs"><span className="tab-active">Hosts</span></div><div className="table-tools"><div className="table-search"><Search /><input aria-label="Filter hosts" disabled={!operator.id} placeholder="Filter hosts" value={hostSearch} onChange={(e) => { setHostSearch(e.target.value); setPage(1) }} /></div></div></div><div className="table-caption"><span>{totalHosts} hosts with records</span><span className="redaction-note"><ShieldCheck /> Vulnerability identifiers redacted</span></div><div className="table-wrap"><table><thead><tr><th>IP address</th><th>Hostname</th><th>Reported ports</th><th>Tags</th><th aria-label="Actions" /></tr></thead><tbody>{!visibleHosts.length && <tr><td colSpan={5}>{!operator.id ? 'Select an operator to load hosts' : tableLoading ? 'Loading records…' : hostsError ? 'Unable to load records' : 'No matching records'}</td></tr>}{visibleHosts.map((host) => <tr key={host.ip} onClick={() => setSelectedHost(host)}><td><b className="mono">{host.ip}</b><StatusPill tone="gray">record</StatusPill></td><td>{host.hostname}</td><td><div className="port-list">{host.ports.map((port) => <span key={port}>{port}</span>)}</div></td><td><div className="tag-list">{host.tags.map((tag) => <span key={tag}>{tag}</span>)}</div></td><td><ChevronRight className="row-arrow" /></td></tr>)}</tbody></table></div><div className="pagination"><span>Showing {currentHosts && totalHosts ? (currentHosts.page - 1) * currentHosts.pageSize + 1 : 0}–{currentHosts ? Math.min(currentHosts.page * currentHosts.pageSize, totalHosts) : 0} of {totalHosts}</span><div><button aria-label="Previous page" disabled={tableLoading || !currentHosts?.hasPrevious} onClick={() => setPage((currentHosts?.page || 1) - 1)}><ChevronLeft /></button><button aria-label="Next page" disabled={tableLoading || !currentHosts?.hasNext} onClick={() => setPage((currentHosts?.page || 1) + 1)}><ChevronRight /></button></div></div></div>}
           </section>

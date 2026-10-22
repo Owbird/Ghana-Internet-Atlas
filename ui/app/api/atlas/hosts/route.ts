@@ -23,8 +23,9 @@ export async function GET(request: NextRequest) {
     const rawPage = Number(request.nextUrl.searchParams.get('page') || 1)
     const requestedPage = Number.isSafeInteger(rawPage) && rawPage > 0 ? Math.min(rawPage, 1000000) : 1
     const pageSize = 5
-    const condition = `o.run_id=$1 AND o.status='ok' AND EXISTS
-      (SELECT 1 FROM routes r WHERE r.run_id=o.run_id AND r.asn::text=$2 AND o.ip <<= r.prefix)
+    const condition = `o.run_id=$1 AND o.status='ok' AND
+      (SELECT r.asn::text FROM routes r WHERE r.run_id=o.run_id AND o.ip <<= r.prefix
+        ORDER BY masklen(r.prefix) DESC,r.asn LIMIT 1)=$2
       AND ($3='' OR strpos(lower(host(o.ip)),lower($3))>0
         OR strpos(lower(coalesce(o.payload->'hostnames','[]'::jsonb)::text),lower($3))>0
         OR strpos(lower(coalesce(o.payload->'tags','[]'::jsonb)::text),lower($3))>0)`
