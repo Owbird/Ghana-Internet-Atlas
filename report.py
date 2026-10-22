@@ -1044,7 +1044,7 @@ def distributed_section(data):
         f"<td>{w['requests']:,}</td><td>{w['saved']:,}</td>"
         f"<td>{esc(w['host_rate']) + '/s' if 'host_rate' in w else '—'}</td>"
         f"<td>{str(round(float(w['host_pause']), 1)) + 's' if 'host_pause' in w else '—'}</td></tr>"
-        for w in info['workers']
+        for w in info['workers'] if w['health'] == 'healthy'
     )
     counts = info['counts']
     terminal = sum(counts.get(key, 0) for key in ('ok', 'no_data', 'exhausted'))
@@ -1054,7 +1054,8 @@ def distributed_section(data):
         f"{counts.get('retry', 0):,} awaiting retry · "
         f"{counts.get('exhausted', 0):,} exhausted · "
         "Rate budgets and cooldowns apply independently to each hostname. "
-        "Worker counts below are per process; repeated host settings are shared.",
+        "Only healthy workers are shown. Worker counts below are per process; "
+        "repeated host settings are shared.",
         '<div class="table-wrap"><table><thead><tr><th>Host</th><th>Instance</th>'
         '<th>Health</th><th>Last heartbeat</th><th>Requests</th><th>Saved</th>'
         '<th>Host budget</th><th>Host cooldown</th>'
