@@ -479,6 +479,19 @@ def chips(items, tone=""):
     )
 
 
+def read_asn_measurements(db):
+    """Latest saved Ghana ad-measurement sample count for each ASN, if imported."""
+    if not db.execute("SELECT to_regclass('asn_measurements') AS name").fetchone()['name']:
+        return {}
+    return {
+        f"AS{row['asn']}": row
+        for row in db.execute('''SELECT DISTINCT ON (asn)
+            asn,samples,measured_on,window_days FROM asn_measurements
+            WHERE country=%s
+            ORDER BY asn,measured_on DESC,fetched_at DESC,window_days DESC''', ('GH',))
+    }
+
+
 def networks_section(data, owners, asn_names=None):
     """Per-network table for the networks reached so far."""
     if not owners:
@@ -500,6 +513,21 @@ def networks_section(data, owners, asn_names=None):
 
     rows = []
     for label, entry in scanned:
+        measurements = data.get('asn_measurements', {})
+        sample_cells = []
+        asns = label.split(' / ')
+        for asn in asns:
+            measurement = measurements.get(asn)
+            prefix = f'{asn}: ' if len(asns) > 1 else ''
+            if measurement is None:
+                sample_cells.append(esc(prefix + '—'))
+            else:
+                detail = (f"APNIC · GH · {measurement['measured_on']} · "
+                          f"{measurement['window_days']}-day window")
+                sample_cells.append(
+                    f'<span title="{esc(detail)}">{esc(prefix)}{measurement["samples"]:,}</span>'
+                )
+        samples = '<br>'.join(sample_cells)
         network_label = " / ".join(
             f"{asn} ({name})" if name else asn
             for asn in label.split(" / ")
@@ -518,6 +546,7 @@ def networks_section(data, owners, asn_names=None):
         rows.append(f"""
         <tr>
           <td>{esc(network_label)}</td>
+          <td class="num">{samples}</td>
           <td class="num">{announced:,}</td>
           <td class="num">{entry['resolved']:,}</td>
           <td class="num">{esc(progress)}</td>
@@ -529,6 +558,7 @@ def networks_section(data, owners, asn_names=None):
         """ if announced else f"""
         <tr>
           <td>{esc(network_label)}</td>
+          <td class="num">{samples}</td>
           <td class="num">—</td>
           <td class="num">{entry['resolved']:,}</td>
           <td class="num">—</td>
@@ -544,7 +574,8 @@ def networks_section(data, owners, asn_names=None):
 
     table = (
         '<div class="table-wrap"><table><thead><tr>'
-        '<th>Network (ASN and name)</th><th class="num">Announced addresses</th>'
+        '<th>Network (ASN and name)</th><th class="num">APNIC samples</th>'
+        '<th class="num">Announced addresses</th>'
         '<th class="num">Resolved</th><th class="num">Progress</th>'
         '<th class="num">Records</th><th class="num">Hit rate</th>'
         '<th class="num">Hosts with CVE labels</th><th>Most common ports</th>'
@@ -559,7 +590,9 @@ def networks_section(data, owners, asn_names=None):
         covering it. Announced addresses exclude space covered by a more
         specific announcement from another network. __UNREACHED__ further
         networks have not been reached yet, so these figures describe only
-        the networks listed here.
+        the networks listed here. APNIC samples are ad-based measurement counts
+        from the latest saved Ghana estimate for each ASN; hover for its date
+        and averaging window. A dash means no saved measurement is available.
       </p>
       {table}
     </section>
@@ -1135,6 +1168,7 @@ def main():
             snapshot = run['snapshot']
             lookup, owners = build_attribution(snapshot)
             data = read_database(run['id'], args.host_limit, args.max_ports, lookup, connection=db)
+            data['asn_measurements'] = read_asn_measurements(db)
             counts = {r['status']: r['count'] for r in db.execute(
                 'SELECT status,count FROM run_counts WHERE run_id=%s', (run['id'],))}
             workers = db.execute("""SELECT *,
