@@ -20,7 +20,6 @@ per-network table is added to the report.
 """
 
 import argparse
-import heapq
 import html
 import ipaddress
 import json
@@ -262,114 +261,165 @@ def read_database(path, host_limit, max_ports, lookup=None, connection=None):
         "error_messages": Counter(),
     }
 
-    host_heap = []
-
-    # A server cursor streams a consistent, read-only PostgreSQL snapshot.
     from contextlib import nullcontext
     supplied_connection = connection is not None
     with nullcontext(connection) if supplied_connection else atlas_db.connect() as connection:
         if not supplied_connection:
             connection.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
-        from psycopg.rows import tuple_row
-        cursor = connection.cursor(name='report_observations', row_factory=tuple_row)
-        cursor.itersize = 1000
-        cursor.execute("""
-            SELECT host(ip), status, payload, error, fetched_at
+        rows = connection.execute(
+            'SELECT status, count(*) AS count FROM observations WHERE run_id=%s GROUP BY status',
+            (path,)).fetchall()
+        result["statuses"] = Counter({row["status"]: row["count"] for row in rows})
+
+        summary = connection.execute("""
+            WITH records AS (
+                SELECT payload,
+                    CASE WHEN jsonb_typeof(payload->'ports') = 'array'
+                        THEN payload->'ports' ELSE '[]'::jsonb END AS ports,
+                    CASE WHEN jsonb_typeof(payload->'vulns') = 'array'
+                        THEN payload->'vulns' ELSE '[]'::jsonb END AS vulns,
+                    CASE WHEN jsonb_typeof(payload->'hostnames') = 'array'
+                        THEN payload->'hostnames' ELSE '[]'::jsonb END AS hostnames,
+                    CASE WHEN jsonb_typeof(payload->'tags') = 'array'
+                        THEN payload->'tags' ELSE '[]'::jsonb END AS tags
+                FROM observations
+                WHERE run_id=%s AND status='ok' AND jsonb_typeof(payload) = 'object'
+            ), counted AS (
+                SELECT *, jsonb_array_length(ports) AS port_count FROM records
+            )
+            SELECT count(*) AS valid_records,
+                count(*) FILTER (WHERE port_count > %s) AS anomalous_hosts,
+                coalesce(sum(port_count) FILTER (WHERE port_count > %s), 0) AS anomalous_ports,
+                count(*) FILTER (WHERE jsonb_array_length(vulns) > 0) AS hosts_with_cves,
+                count(*) FILTER (WHERE jsonb_array_length(hostnames) > 0) AS hosts_with_names,
+                count(*) FILTER (WHERE tags ? 'eol-product') AS eol_hosts,
+                coalesce(max(jsonb_array_length(vulns)), 0) AS max_cves_per_host
+            FROM counted
+        """, (path, max_ports, max_ports)).fetchone()
+        result.update(summary)
+        result["malformed_records"] = result["statuses"]["ok"] - result["valid_records"]
+
+        saved = connection.execute("""
+            SELECT min(fetched_at) AS first_saved, max(fetched_at) AS last_saved
             FROM observations WHERE run_id=%s
-        """, (path,))
-        for ip, status, raw, error, saved_at in cursor:
-            result["statuses"][str(status)] += 1
+        """, (path,)).fetchone()
+        result["first_saved"] = str(saved["first_saved"] or "") or None
+        result["last_saved"] = str(saved["last_saved"] or "") or None
 
-            label = (lookup(str(ip)) if lookup else None) or UNATTRIBUTED
-            network = result["networks"].setdefault(
-                label, new_network_stats()
+        result["error_messages"] = Counter({
+            row["error"]: row["count"] for row in connection.execute("""
+                SELECT left(coalesce(error, 'Unspecified'), 200) AS error, count(*) AS count
+                FROM observations WHERE run_id=%s AND status IN ('retry', 'exhausted')
+                GROUP BY 1
+            """, (path,)).fetchall()
+        })
+
+        record_sql = """WITH records AS (
+            SELECT CASE WHEN jsonb_typeof(payload->%s) = 'array'
+                    THEN payload->%s ELSE '[]'::jsonb END AS items_json
+            FROM observations WHERE run_id=%s AND status='ok' AND jsonb_typeof(payload) = 'object'
+        ) SELECT value, count(*) AS count FROM records
+        CROSS JOIN LATERAL (
+            SELECT DISTINCT value FROM jsonb_array_elements_text(items_json) AS value
+            WHERE btrim(value) <> ''
+        ) AS items
+        GROUP BY value ORDER BY count DESC"""
+        for field, counter in (("cpes", "cpes"), ("tags", "tags"), ("vulns", "cves")):
+            result[counter] = Counter({row["value"]: row["count"] for row in connection.execute(
+                record_sql, (field, field, path)).fetchall()})
+
+        result["ports"] = Counter({row["port"]: row["count"] for row in connection.execute("""
+            WITH records AS (
+                SELECT CASE WHEN jsonb_typeof(payload->'ports') = 'array'
+                    THEN payload->'ports' ELSE '[]'::jsonb END AS ports
+                FROM observations WHERE run_id=%s AND status='ok' AND jsonb_typeof(payload) = 'object'
+            ) SELECT value::integer AS port, count(*) AS count FROM records
+            CROSS JOIN LATERAL (SELECT DISTINCT value FROM jsonb_array_elements_text(ports) AS value) AS items
+            WHERE jsonb_array_length(ports) <= %s AND value ~ '^[0-9]+$'
+                AND value::integer BETWEEN 1 AND 65535
+            GROUP BY value::integer ORDER BY count DESC
+        """, (path, max_ports)).fetchall()})
+        result["port_counts"] = Counter({row["port_count"]: row["count"] for row in connection.execute("""
+            SELECT jsonb_array_length(CASE WHEN jsonb_typeof(payload->'ports') = 'array'
+                    THEN payload->'ports' ELSE '[]'::jsonb END) AS port_count, count(*) AS count
+            FROM observations WHERE run_id=%s AND status='ok' AND jsonb_typeof(payload) = 'object'
+            GROUP BY 1 HAVING jsonb_array_length(CASE WHEN jsonb_typeof(payload->'ports') = 'array'
+                    THEN payload->'ports' ELSE '[]'::jsonb END) <= %s
+        """, (path, max_ports)).fetchall()})
+
+        network_rows = connection.execute("""
+            WITH attributed AS (
+                SELECT o.status, o.payload, coalesce(network.label, %s) AS label
+                FROM observations o
+                LEFT JOIN LATERAL (
+                    SELECT string_agg('AS' || asn::text, ' / ' ORDER BY asn) AS label
+                    FROM routes r WHERE r.run_id=%s AND o.ip <<= r.prefix
+                    GROUP BY r.prefix ORDER BY masklen(r.prefix) DESC LIMIT 1
+                ) AS network ON true
+                WHERE o.run_id=%s
+            ), records AS (
+                SELECT label,
+                    CASE WHEN jsonb_typeof(payload->'ports') = 'array'
+                        THEN payload->'ports' ELSE '[]'::jsonb END AS ports,
+                    CASE WHEN jsonb_typeof(payload->'vulns') = 'array'
+                        THEN payload->'vulns' ELSE '[]'::jsonb END AS vulns
+                FROM attributed WHERE status='ok' AND jsonb_typeof(payload) = 'object'
             )
-
-            if status in ("ok", "no_data"):
-                network["resolved"] += 1
-
-            if saved_at:
-                stamp = str(saved_at)
-                first = result["first_saved"]
-                last = result["last_saved"]
-                result["first_saved"] = min(first, stamp) if first else stamp
-                result["last_saved"] = max(last, stamp) if last else stamp
-
-            if status in ("retry", "exhausted"):
-                network["errors"] += 1
-                # Limit retained error text to keep the report manageable.
-                result["error_messages"][str(error or "Unspecified")[:200]] += 1
-
-            if status != "ok":
-                continue
-
-            try:
-                record = raw if isinstance(raw, dict) else json.loads(raw)
-                if not isinstance(record, dict):
-                    raise ValueError("Payload is not an object")
-            except (TypeError, ValueError):
-                result["malformed_records"] += 1
-                continue
-
-            ports = port_list(record.get("ports"))
-            cpes = strings(record.get("cpes"))
-            tags = strings(record.get("tags"))
-            cves = strings(record.get("vulns"))
-            names = strings(record.get("hostnames"))
-            anomalous = len(ports) > max_ports
-
-            result["valid_records"] += 1
-            result["cpes"].update(cpes)
-            result["tags"].update(tags)
-            result["cves"].update(cves)
-            result["hosts_with_cves"] += bool(cves)
-            result["hosts_with_names"] += bool(names)
-            result["eol_hosts"] += "eol-product" in tags
-            result["max_cves_per_host"] = max(
-                result["max_cves_per_host"], len(cves)
-            )
-
-            network["records"] += 1
-            network["cve_hosts"] += bool(cves)
-
-            if anomalous:
-                # Likely a tarpit, honeypot or middlebox. Keep it visible in
-                # the host explorer but out of the port statistics.
-                result["anomalous_hosts"] += 1
-                result["anomalous_ports"] += len(ports)
-                network["anomalous"] += 1
-            else:
-                result["ports"].update(ports)
-                result["port_counts"][len(ports)] += 1
-                network["ports"].update(ports)
-
-            host = {
-                "ip": str(ip),
-                "asn": label,
-                "ports": ports,
-                "names": names,
-                "cpes": cpes,
-                "tags": tags,
-                "cves": cves,
-                "anomalous": anomalous,
-                "saved_at": str(saved_at or ""),
+            SELECT label, count(*) FILTER (WHERE status IN ('ok', 'no_data')) AS resolved,
+                count(*) FILTER (WHERE status='ok' AND jsonb_typeof(payload) = 'object') AS records,
+                count(*) FILTER (WHERE status IN ('retry', 'exhausted')) AS errors,
+                count(*) FILTER (WHERE status='ok' AND jsonb_typeof(payload) = 'object'
+                    AND jsonb_array_length(CASE WHEN jsonb_typeof(payload->'vulns') = 'array'
+                        THEN payload->'vulns' ELSE '[]'::jsonb END) > 0) AS cve_hosts,
+                count(*) FILTER (WHERE status='ok' AND jsonb_typeof(payload) = 'object'
+                    AND jsonb_array_length(CASE WHEN jsonb_typeof(payload->'ports') = 'array'
+                        THEN payload->'ports' ELSE '[]'::jsonb END) > %s) AS anomalous
+            FROM attributed GROUP BY label
+        """, (UNATTRIBUTED, path, path, max_ports)).fetchall()
+        for row in network_rows:
+            result["networks"][row["label"]] = {
+                "resolved": row["resolved"], "records": row["records"],
+                "errors": row["errors"], "cve_hosts": row["cve_hosts"],
+                "anomalous": row["anomalous"], "ports": Counter(),
             }
+        network_ports = connection.execute("""
+            WITH attributed AS (
+                SELECT o.payload, coalesce(network.label, %s) AS label
+                FROM observations o LEFT JOIN LATERAL (
+                    SELECT string_agg('AS' || asn::text, ' / ' ORDER BY asn) AS label
+                    FROM routes r WHERE r.run_id=%s AND o.ip <<= r.prefix
+                    GROUP BY r.prefix ORDER BY masklen(r.prefix) DESC LIMIT 1
+                ) AS network ON true
+                WHERE o.run_id=%s AND o.status='ok' AND jsonb_typeof(o.payload) = 'object'
+            ) SELECT label, value::integer AS port, count(*) AS count FROM attributed
+            CROSS JOIN LATERAL (SELECT DISTINCT value FROM jsonb_array_elements_text(
+                CASE WHEN jsonb_typeof(payload->'ports') = 'array' THEN payload->'ports' ELSE '[]'::jsonb END
+            ) AS value) AS items
+            WHERE jsonb_array_length(CASE WHEN jsonb_typeof(payload->'ports') = 'array'
+                    THEN payload->'ports' ELSE '[]'::jsonb END) <= %s
+                AND value ~ '^[0-9]+$' AND value::integer BETWEEN 1 AND 65535
+            GROUP BY label, value::integer
+        """, (UNATTRIBUTED, path, path, max_ports)).fetchall()
+        for row in network_ports:
+            result["networks"].setdefault(row["label"], new_network_stats())["ports"][row["port"]] = row["count"]
 
-            # Keep a bounded sample with the most reported ports.
-            # This is an inspection sample, not a risk ranking.
-            item = (len(ports), str(ip), host)
+        for row in connection.execute("""
+            SELECT host(ip) AS ip, payload, fetched_at FROM observations
+            WHERE run_id=%s AND status='ok' AND jsonb_typeof(payload) = 'object'
+            ORDER BY jsonb_array_length(CASE WHEN jsonb_typeof(payload->'ports') = 'array'
+                    THEN payload->'ports' ELSE '[]'::jsonb END) DESC, ip DESC LIMIT %s
+        """, (path, host_limit)).fetchall():
+            record = row["payload"]
+            ports = port_list(record.get("ports"))
+            result.setdefault("hosts", []).append({
+                "ip": str(row["ip"]), "asn": (lookup(str(row["ip"])) if lookup else None) or UNATTRIBUTED,
+                "ports": ports, "names": strings(record.get("hostnames")),
+                "cpes": strings(record.get("cpes")), "tags": strings(record.get("tags")),
+                "cves": strings(record.get("vulns")), "anomalous": len(ports) > max_ports,
+                "saved_at": str(row["fetched_at"] or ""),
+            })
 
-            if len(host_heap) < host_limit:
-                heapq.heappush(host_heap, item)
-            elif item[:2] > host_heap[0][:2]:
-                heapq.heapreplace(host_heap, item)
-
-        cursor.close()
-
-    result["hosts"] = [
-        item[2]
-        for item in sorted(host_heap, reverse=True)
-    ]
+    result.setdefault("hosts", [])
     return result
 
 
@@ -1080,6 +1130,7 @@ def main():
         # All report queries share a consistent transaction, including metadata.
         with atlas_db.connect() as db:
             db.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+            db.execute("SET LOCAL statement_timeout = '60s'")
             run = atlas_db.selected_run(db, args.run)
             snapshot = run['snapshot']
             lookup, owners = build_attribution(snapshot)
